@@ -20,6 +20,7 @@ from neural.modules import (
     BatchDesignBaseline,
     RandomDesignBaseline,
     rmv,
+    LSTMDADNetwork
 )
 
 from oed.primitives import observation_sample, latent_sample, compute_design
@@ -27,6 +28,7 @@ from experiment_tools.pyro_tools import auto_seed
 from oed.design import OED
 from contrastive.mi import PriorContrastiveEstimation
 
+AIA_FLAG = True
 
 class EncoderNetwork(nn.Module):
     """Encoder network for location finding example"""
@@ -80,6 +82,7 @@ class HiddenObjects(nn.Module):
         p=1,  # physical dimension
         K=1,  # number of sources
         T=2,  # number of experiments
+        **kwargs
     ):
         super().__init__()
         self.design_net = design_net
@@ -88,9 +91,18 @@ class HiddenObjects(nn.Module):
         # Set prior:
         self.theta_loc = theta_loc if theta_loc is not None else torch.zeros((K, p))
         self.theta_covmat = theta_covmat if theta_covmat is not None else torch.eye(p)
-        self.theta_prior = dist.MultivariateNormal(
-            self.theta_loc, self.theta_covmat
-        ).to_event(1)
+        if AIA_FLAG:
+            # self.noise_loc = torch.zeros(p//T)
+            self.init_x = kwargs["init_x"]
+        # todo make all theta dependent on each other
+        if AIA_FLAG:
+            self.theta_prior = dist.MultivariateNormal(
+                self.theta_loc, self.theta_covmat
+            ).to_event(1)
+        else:
+            self.theta_prior = dist.MultivariateNormal(
+                self.theta_loc, self.theta_covmat
+            ).to_event(1)
         # Observations noise scale:
         self.noise_scale = noise_scale if noise_scale is not None else torch.tensor(1.0)
         self.n = 1  # batch=1
@@ -109,6 +121,7 @@ class HiddenObjects(nn.Module):
         mean_y = torch.log(self.base_signal + sq_two_norm_inverse.sum(-1, keepdim=True))
         return mean_y
 
+
     def model(self):
         if hasattr(self.design_net, "parameters"):
             pyro.module("design_net", self.design_net)
@@ -120,21 +133,37 @@ class HiddenObjects(nn.Module):
         y_outcomes = []
         xi_designs = []
 
+
         # T-steps experiment
         for t in range(self.T):
             ####################################################################
-            # Get a design xi; shape is [num-outer-samples x 1 x 1]
+            # Get a design xi; shape is [num-outer-samples x 1 x p] if it is not LSTM else [num-outer-samples x 1 x p//T]
             ####################################################################
             xi = compute_design(
                 f"xi{t + 1}", self.design_net.lazy(*zip(xi_designs, y_outcomes))
             )
 
             ####################################################################
-            # Sample y at xi; shape is [num-outer-samples x 1]
+            # Sample y at xi; shape is [num-outer-samples x 1] if AIA_FLAG==FALSE else shape is [num-outer-samples x (1+p//T)], Upsilon = (y,x)
             ####################################################################
-            mean = self.forward_map(xi, theta)
-            sd = self.noise_scale
-            y = observation_sample(f"y{t + 1}", dist.Normal(mean, sd).to_event(1))
+            if AIA_FLAG:
+                # modify xi by adding the previous agent location y
+                if t!=0:
+                    mod_x = xi + y_outcomes[-1][...,1:].reshape(xi.shape)
+                else:
+                    mod_x = xi + self.init_x
+                mean = self.forward_map(mod_x, theta[...,t*2:(t+1)*2])
+                sd = self.noise_scale
+                y = observation_sample(f"y{t + 1}", dist.Normal(mean, sd).to_event(1))
+                if mod_x.shape[0] == 1:
+                    mod_x = mod_x.reshape([mod_x.shape[0], mod_x.shape[-1]])
+                else:
+                    mod_x = mod_x.squeeze()
+                y = torch.cat((y, mod_x), dim=-1)
+            else:
+                mean = self.forward_map(xi, theta)
+                sd = self.noise_scale
+                y = observation_sample(f"y{t + 1}", dist.Normal(mean, sd).to_event(1))
 
             y_outcomes.append(y)
             xi_designs.append(xi)
@@ -167,7 +196,28 @@ class HiddenObjects(nn.Module):
         if theta is not None:
             model = pyro.condition(self.model, data={"theta": theta})
         else:
-            model = self.model
+            if AIA_FLAG:
+                def _vectorized(fn, *shape, name="vectorization_plate"):
+                    """
+                    Wraps a callable inside an outermost :class:`~pyro.plate` to parallelize
+                    MI computation over `num_particles`, and to broadcast batch shapes of
+                    sample site functions in accordance with the `~pyro.plate` contexts
+                    within which they are embedded.
+                    :param fn: arbitrary callable containing Pyro primitives.
+                    :return: wrapped callable.
+                    """
+
+                    def wrapped_fn(*args, **kwargs):
+                        with pyro.plate_stack(name, shape):
+                            return fn(*args, **kwargs)
+
+                    return wrapped_fn
+
+                model = _vectorized(
+                    self.model, 1, name="outer_vectorization"
+                )
+            else:
+                model = self.model
 
         output = []
         true_thetas = []
@@ -191,7 +241,10 @@ class HiddenObjects(nn.Module):
                         print(f" y{t + 1}: {y}")
 
                 run_df = pd.DataFrame(torch.stack(run_xis).numpy())
-                run_df.columns = [f"xi_{i}" for i in range(self.p)]
+                if AIA_FLAG:
+                    run_df.columns = [f"xi_{i}" for i in range(self.p//self.T)]
+                else:
+                    run_df.columns = [f"xi_{i}" for i in range(self.p)]
                 run_df["observations"] = run_ys
                 run_df["order"] = list(range(1, self.T + 1))
                 run_df["run_id"] = i + 1
@@ -199,6 +252,7 @@ class HiddenObjects(nn.Module):
                 true_thetas.append(true_theta.numpy())
         print(pd.concat(output))
         return pd.concat(output), true_thetas
+
 
 
 def single_run(
@@ -239,6 +293,12 @@ def single_run(
     elif design_network_type == "dad":
         design_net = SetEquivariantDesignNetwork(
             encoder, emitter, empty_value=torch.ones(n, p) * 0.01
+        ).to(device)
+    elif design_network_type == "lstm_dad":
+        encoder = EncoderNetwork((n, p//T), 1+p//T, hidden_dim, encoding_dim)
+        emitter = EmitterNetwork(encoding_dim, (n, p//T))
+        design_net = LSTMDADNetwork(
+            encoder, emitter, empty_value=torch.ones(n, p//T) * 0.01
         ).to(device)
     else:
         raise ValueError(f"design_network_type={design_network_type} not supported.")
@@ -281,6 +341,7 @@ def single_run(
     noise_scale_tensor = noise_scale * torch.tensor(
         1.0, dtype=torch.float32, device=device
     )
+
     # fix the base and the max signal in the G-map
     ho_model = HiddenObjects(
         design_net=design_net,
@@ -292,6 +353,7 @@ def single_run(
         p=p,
         K=K,
         T=T,
+        init_x=torch.zeros(p//T,device=device)
     )
 
     ### Set-up optimiser ###

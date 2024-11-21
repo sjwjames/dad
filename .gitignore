@@ -11,3 +11,4 @@ mlflow_outputs/*
 .vscode/*
 zignore*
 evalruns/*
+dad_code/*

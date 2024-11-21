@@ -119,3 +119,39 @@ class RandomDesignBaseline(SetEquivariantDesignNetwork):
 
     def forward(self, *design_obs_pairs):
         return self.random_designs_dist.sample()
+
+
+class LSTMDADNetwork(SetEquivariantDesignNetwork):
+    def __init__(
+        self, encoder_network, emission_network, empty_value, num_hidden_layers=2
+    ):
+        super().__init__(encoder_network, emission_network, empty_value)
+        self.encoding_dim = self.encoder.encoding_dim
+        self.lstm_net = nn.LSTM(
+            self.encoding_dim, self.encoding_dim, num_hidden_layers, batch_first=True
+        )
+
+    def lstm_history_encodings(self, *design_obs_pairs):
+        # Input to LSTM should be [batch, seq, feature]
+        if len(design_obs_pairs) == 0:
+            # pass zeros to the LSTM if no history is available yet
+            stacked = self.empty_value.new_zeros(1,1,self.encoding_dim)
+        else:
+            # encode available design-obs pairs, h_t, and stack the representations
+            # dimension is: [batch_size, t, encoding_dim]
+            stacked = torch.stack(
+                [
+                    self.encoder(design, obs, t=[idx + 1])
+                    for idx, (design, obs) in enumerate(design_obs_pairs)
+                ],
+                dim=1,
+            )
+        # keep the last state
+        _, (h_n, c_n) = self.lstm_net(stacked)
+        # return the hidden state from the last layer
+        # dimension [batch_size, encoding_dim]
+        return h_n[-1]
+
+    def forward(self, *design_obs_pairs):
+        lstm_encoding = self.lstm_history_encodings(*design_obs_pairs)
+        return self.emitter(lstm_encoding)
